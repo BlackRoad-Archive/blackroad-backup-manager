@@ -8,6 +8,7 @@ Uses tarfile + hashlib. SQLite for job tracking.
 import sqlite3
 import tarfile
 import hashlib
+import logging
 import os
 import sys
 import json
@@ -18,6 +19,8 @@ import fnmatch
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
+
+logger = logging.getLogger(__name__)
 
 
 DB_PATH = os.environ.get("BACKUP_MANAGER_DB", os.path.expanduser("~/.blackroad/backup_manager.db"))
@@ -50,11 +53,11 @@ class BackupJob:
 
 
 def _now() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _job_id(source: str, btype: str) -> str:
-    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     short = hashlib.sha256(source.encode()).hexdigest()[:6]
     return f"{btype}_{ts}_{short}"
 
@@ -152,7 +155,7 @@ def _save_manifest(conn: sqlite3.Connection, job_id: str, manifest: Dict[str, st
     for rel_path, checksum in manifest.items():
         full = source_path / rel_path
         size = full.stat().st_size if full.exists() else 0
-        mtime = datetime.datetime.utcfromtimestamp(full.stat().st_mtime).isoformat() + "Z" if full.exists() else ""
+        mtime = datetime.datetime.fromtimestamp(full.stat().st_mtime, datetime.timezone.utc).isoformat().replace("+00:00", "Z") if full.exists() else ""
         conn.execute("""
             INSERT OR REPLACE INTO file_manifests (job_id, rel_path, checksum, size_bytes, modified_at)
             VALUES (?, ?, ?, ?, ?)
@@ -206,6 +209,7 @@ def create_backup(
     """, (job_id, source, archive_path, backup_type, now,
           parent_job_id, compression, ",".join(tags or [])))
     conn.commit()
+    logger.info("Backup job %s started: %s -> %s (%s)", job_id, source, archive_path, backup_type)
 
     try:
         current_manifest = _sha256_dir_manifest(source)
@@ -277,6 +281,7 @@ def create_backup(
             WHERE id = ?
         """, (size, checksum, completed_at, file_count, parent_job_id, job_id))
         conn.commit()
+        logger.info("Backup job %s succeeded: %d files, %d bytes", job_id, file_count, size)
 
         return BackupJob(
             id=job_id, source_path=source, dest_path=archive_path,
@@ -293,6 +298,7 @@ def create_backup(
             WHERE id = ?
         """, (msg, _now(), job_id))
         conn.commit()
+        logger.error("Backup job %s failed: %s", job_id, msg)
         # Clean up partial archive
         if os.path.exists(archive_path):
             os.unlink(archive_path)
@@ -322,9 +328,10 @@ def restore(
         with tarfile.open(archive_path, "r:*") as tar:
             members = tar.getmembers()
             for member in members:
-                tar.extract(member, path=str(dest_path), set_attrs=False)
+                tar.extract(member, path=str(dest_path), set_attrs=False, filter="data")
                 files_written += 1
 
+        logger.info("Restore of job %s succeeded: %d files written to %s", job_id, files_written, dest_path)
         conn.execute("""
             INSERT INTO restore_events (job_id, dest_path, status, files_written, restored_at)
             VALUES (?, ?, 'success', ?, ?)
@@ -339,6 +346,7 @@ def restore(
         }
 
     except Exception as exc:
+        logger.error("Restore of job %s failed: %s", job_id, exc)
         conn.execute("""
             INSERT INTO restore_events (job_id, dest_path, status, files_written, restored_at, error)
             VALUES (?, ?, 'failed', ?, ?, ?)
@@ -379,6 +387,7 @@ def verify_integrity(job_id: str, db_path: str = DB_PATH) -> Dict[str, Any]:
     if valid:
         conn.execute("UPDATE backup_jobs SET status = 'verified' WHERE id = ?", (job_id,))
         conn.commit()
+    logger.info("Verify job %s: valid=%s checksum_ok=%s tar_readable=%s", job_id, valid, checksum_ok, tar_ok)
 
     return {
         "job_id": job_id,
@@ -448,7 +457,8 @@ def prune_old(
 
     if not dry_run:
         conn.commit()
-
+    logger.info("Prune for %s: deleted=%d freed=%d bytes dry_run=%s",
+                source, len(deleted_jobs), freed_bytes, dry_run)
     return {
         "dry_run": dry_run,
         "deleted": deleted_jobs,
@@ -621,4 +631,8 @@ def cli_main(argv: List[str] = None) -> int:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     sys.exit(cli_main())
