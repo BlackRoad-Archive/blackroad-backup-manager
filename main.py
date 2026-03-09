@@ -9,6 +9,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -16,9 +17,11 @@ import sys
 import tarfile
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 DB_PATH = Path(os.environ.get("BACKUP_DB", "~/.blackroad/backups.db")).expanduser()
@@ -141,7 +144,7 @@ class BackupManager:
                         compression: str = "gzip", retention_days: int = 30,
                         retention_count: int = 10, schedule: str | None = None) -> BackupTarget:
         tid = str(uuid.uuid4())
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
                 "INSERT INTO backup_targets(id, name, target_type, source_path, compression, "
@@ -164,7 +167,7 @@ class BackupManager:
         target = BackupTarget.from_row(row)
 
         bid = str(uuid.uuid4())
-        started = datetime.utcnow()
+        started = datetime.now(timezone.utc)
         BACKUP_STORE.mkdir(parents=True, exist_ok=True)
 
         # Determine output path
@@ -202,7 +205,7 @@ class BackupManager:
         except Exception as exc:
             error = str(exc)
 
-        finished = datetime.utcnow()
+        finished = datetime.now(timezone.utc)
         dur = int((finished - started).total_seconds() * 1000)
         status = "success" if error is None else "failed"
 
@@ -236,7 +239,7 @@ class BackupManager:
         backup = Backup.from_row(row)
 
         rid = str(uuid.uuid4())
-        started = datetime.utcnow()
+        started = datetime.now(timezone.utc)
         restore_dir = Path(restore_path).expanduser()
         restore_dir.mkdir(parents=True, exist_ok=True)
 
@@ -257,12 +260,12 @@ class BackupManager:
             if actual != backup.checksum:
                 raise ValueError(f"Checksum mismatch: expected {backup.checksum}, got {actual}")
             with tarfile.open(str(bak_path), "r:*") as tar:
-                tar.extractall(str(restore_dir))
+                tar.extractall(str(restore_dir), filter="data")
                 files_restored = len(tar.getnames())
         except Exception as exc:
             error = str(exc)
 
-        finished = datetime.utcnow()
+        finished = datetime.now(timezone.utc)
         status = "success" if error is None else "failed"
         with get_conn() as conn:
             conn.execute(
@@ -310,7 +313,7 @@ class BackupManager:
 
         backups = [Backup.from_row(r) for r in rows]
         deleted = 0
-        cutoff = datetime.utcnow() - timedelta(days=target.retention_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=target.retention_days)
 
         to_delete = []
         # Keep newest N
@@ -443,4 +446,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     main()
